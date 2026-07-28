@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mojo-pandas"
+version = "0.1.0"
+description = "Mojo kernels for pandas-style columnar operations"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pandas"]
+license = "MIT"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]

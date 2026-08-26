@@ -1,6 +1,5 @@
 """Columnar pandas kernels exposed through a small C ABI."""
 
-from std.algorithm import parallelize
 from std.math import iota, isnan, sqrt
 from std.sys.info import simd_width_of
 
@@ -143,6 +142,47 @@ def f64_sort_key(value: Float64, ascending: Bool, nan_first: Bool) -> UInt64:
     return key if ascending else ~key
 
 
+def merge_f64_range(
+    values: FPtr,
+    src: IPtr,
+    dst: IPtr,
+    n: Int,
+    width: Int,
+    ascending: Bool,
+    nan_first: Bool,
+):
+    var start = 0
+    while start < n:
+        var mid = min(start + width, n)
+        var end = min(start + width + width, n)
+        var left = start
+        var right = mid
+        var pos = start
+        while left < mid and right < end:
+            var a = f64_sort_key(
+                values[Int(src[left])], ascending, nan_first
+            )
+            var b = f64_sort_key(
+                values[Int(src[right])], ascending, nan_first
+            )
+            if a <= b:
+                dst[pos] = src[left]
+                left += 1
+            else:
+                dst[pos] = src[right]
+                right += 1
+            pos += 1
+        while left < mid:
+            dst[pos] = src[left]
+            left += 1
+            pos += 1
+        while right < end:
+            dst[pos] = src[right]
+            right += 1
+            pos += 1
+        start += width + width
+
+
 def argsort_f64(
     values: FPtr,
     idx: IPtr,
@@ -159,33 +199,25 @@ def argsort_f64(
     while i < n:
         idx[i] = Int64(i)
         i += 1
-
-    i = 0
-    while i + W <= n:
-        var vals = values.load[width=W](i)
-        var bits = vals.to_bits[DType.uint64]()
-        var sign = SIMD[DType.uint64, W](UInt64(1) << 63)
-        bits = vals.eq(0.0).select(SIMD[DType.uint64, W](0), bits)
-        var keys = (bits & sign).ne(0).select(~bits, bits ^ sign)
-        if not ascending:
-            keys = ~keys
-        var nan_key = UInt64(0) if nan_first else ~UInt64(0)
-        keys = isnan(vals).select(SIMD[DType.uint64, W](nan_key), keys)
-        work.store(i, keys.cast[DType.int64]())
-        i += W
-    while i < n:
-        work[i] = Int64(f64_sort_key(values[i], ascending, nan_first))
-        i += 1
-
-    @parameter
-    def before(a: Int64, b: Int64) -> Bool:
-        var ak: UInt64 = work[Int(a)].to_bits[DType.uint64]()
-        var bk: UInt64 = work[Int(b)].to_bits[DType.uint64]()
-        if ak == bk:
-            return a < b
-        return ak < bk
-
-    sort[before](Span(unsafe_ptr=idx, length=n))
+    var src = idx
+    var dst_ptr = work
+    var sorted_in_idx = True
+    var width = 1
+    while width < n:
+        merge_f64_range(values, src, dst_ptr, n, width, ascending, nan_first)
+        var tmp = src
+        src = dst_ptr
+        dst_ptr = tmp
+        sorted_in_idx = not sorted_in_idx
+        width *= 2
+    if not sorted_in_idx:
+        i = 0
+        while i + W <= n:
+            idx.store(i, src.load[width=W](i))
+            i += W
+        while i < n:
+            idx[i] = src[i]
+            i += 1
 
 
 def merge_i64_range(
@@ -241,22 +273,7 @@ def argsort_i64(values: IPtr, idx: IPtr, work: IPtr, n: Int, ascending: Bool):
     var sorted_in_idx = True
     var width = 1
     while width < n:
-        if n >= 262144:
-            var merges_per_task = max(1, 32768 // (width + width))
-            var chunk = merges_per_task * (width + width)
-            var tasks = (n + chunk - 1) // chunk
-
-            @parameter
-            def merge_task(task: Int):
-                var start = task * chunk
-                merge_i64_range(
-                    values, src, dst_ptr, n, width, start, min(start + chunk, n),
-                    ascending,
-                )
-
-            parallelize[merge_task](tasks, min(tasks, 16))
-        else:
-            merge_i64_range(values, src, dst_ptr, n, width, 0, n, ascending)
+        merge_i64_range(values, src, dst_ptr, n, width, 0, n, ascending)
         var tmp = src
         src = dst_ptr
         dst_ptr = tmp

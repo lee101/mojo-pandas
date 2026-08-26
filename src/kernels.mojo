@@ -1,10 +1,15 @@
 """Columnar pandas kernels exposed through a small C ABI."""
 
+from max.algorithm import parallelize
 from std.math import iota, isnan, sqrt
+from std.memory import stack_allocation
 from std.sys.info import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
+comptime UPtr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
+comptime GROUPBY_PARALLEL_THRESHOLD = 262_144
+comptime SORT_RADIX_THRESHOLD = 2_048
 
 
 def fp(addr: Int) -> FPtr:
@@ -13,6 +18,10 @@ def fp(addr: Int) -> FPtr:
 
 def ip(addr: Int) -> IPtr:
     return IPtr(unsafe_from_address=addr)
+
+
+def up(addr: Int) -> UPtr:
+    return UPtr(unsafe_from_address=addr)
 
 
 def groupby_reduce(
@@ -41,7 +50,7 @@ def groupby_reduce(
             var v = values[j * n + i]
             if isnan(v):
                 continue
-            var k = g * ncols + j
+            var k = j * ngroups + g
             if op == 2:
                 if counts[k] == 0 or v < dst[k]:
                     dst[k] = v
@@ -67,6 +76,43 @@ def groupby_reduce(
         for k in range(size):
             if Int(counts[k]) < min_count:
                 dst[k] = 0.0 / Float64(0)
+
+
+def groupby_var_column(
+    codes: IPtr,
+    values: FPtr,
+    dst: FPtr,
+    means: FPtr,
+    counts: IPtr,
+    n: Int,
+    ncols: Int,
+    ngroups: Int,
+    j: Int,
+):
+    for i in range(n):
+        var g = Int(codes[i])
+        if g < 0 or g >= ngroups:
+            continue
+        var v = values[j * n + i]
+        if not isnan(v):
+            var k = j * ngroups + g
+            means[k] += v
+            counts[k] += 1
+
+    for g in range(ngroups):
+        var k = j * ngroups + g
+        if counts[k] > 0:
+            means[k] /= Float64(counts[k])
+
+    for i in range(n):
+        var g = Int(codes[i])
+        if g < 0 or g >= ngroups:
+            continue
+        var v = values[j * n + i]
+        if not isnan(v):
+            var k = j * ngroups + g
+            var d = v - means[k]
+            dst[k] += d * d
 
 
 def groupby_var(
@@ -96,31 +142,20 @@ def groupby_var(
     for k in range(size):
         counts[k] = 0
 
-    for j in range(ncols):
-        for i in range(n):
-            var g = Int(codes[i])
-            if g < 0 or g >= ngroups:
-                continue
-            var v = values[j * n + i]
-            if not isnan(v):
-                var k = g * ncols + j
-                means[k] += v
-                counts[k] += 1
+    @parameter
+    def process_column(j: Int):
+        groupby_var_column(
+            codes, values, dst, means, counts, n, ncols, ngroups, j
+        )
 
-        for g in range(ngroups):
-            var k = g * ncols + j
-            if counts[k] > 0:
-                means[k] /= Float64(counts[k])
+    if n >= GROUPBY_PARALLEL_THRESHOLD and ncols > 1:
+        parallelize[process_column](ncols, min(ncols, 4))
+    else:
+        for j in range(ncols):
+            groupby_var_column(
+                codes, values, dst, means, counts, n, ncols, ngroups, j
+            )
 
-        for i in range(n):
-            var g = Int(codes[i])
-            if g < 0 or g >= ngroups:
-                continue
-            var v = values[j * n + i]
-            if not isnan(v):
-                var k = g * ncols + j
-                var d = v - means[k]
-                dst[k] += d * d
     for k in range(size):
         if Int(counts[k]) > ddof:
             dst[k] /= Float64(Int(counts[k]) - ddof)
@@ -140,6 +175,69 @@ def f64_sort_key(value: Float64, ascending: Bool, nan_first: Bool) -> UInt64:
     var sign = UInt64(1) << 63
     var key = ~bits if (bits & sign) != 0 else bits ^ sign
     return key if ascending else ~key
+
+
+def materialize_f64_sort_keys(
+    values: FPtr,
+    keys: UPtr,
+    n: Int,
+    ascending: Bool,
+    nan_first: Bool,
+):
+    comptime W = simd_width_of[DType.float64]()
+    comptime SIGN = UInt64(0x8000000000000000)
+    comptime EXPONENT = UInt64(0x7ff0000000000000)
+    comptime MANTISSA = UInt64(0x000fffffffffffff)
+    var words = values.bitcast[UInt64]()
+    var sign = SIMD[DType.uint64, W](SIGN)
+    var exponent = SIMD[DType.uint64, W](EXPONENT)
+    var mantissa = SIMD[DType.uint64, W](MANTISSA)
+    var nan_key = SIMD[DType.uint64, W](
+        UInt64(0) if nan_first else ~UInt64(0)
+    )
+    var i = 0
+    while i + W <= n:
+        var bits = words.load[width=W](i)
+        var negative = (bits & sign).ne(0)
+        var normalized = negative.select(~bits, bits ^ sign)
+        normalized = ((bits & ~sign).eq(0)).select(sign, normalized)
+        if not ascending:
+            normalized = ~normalized
+        var nan = ((bits & exponent).eq(exponent)) & (
+            (bits & mantissa).ne(0)
+        )
+        keys.store(i, nan.select(nan_key, normalized))
+        i += W
+    while i < n:
+        keys[i] = f64_sort_key(values[i], ascending, nan_first)
+        i += 1
+
+
+def radix_argsort_f64(keys: UPtr, idx: IPtr, work: IPtr, n: Int):
+    comptime RADIX_SIZE = 256
+    var counts = stack_allocation[RADIX_SIZE, Int64]()
+    var source = idx
+    var destination = work
+    for radix_pass in range(8):
+        for bucket in range(RADIX_SIZE):
+            counts[bucket] = 0
+        var shift = UInt64(radix_pass * 8)
+        for i in range(n):
+            var bucket = Int((keys[Int(source[i])] >> shift) & UInt64(255))
+            counts[bucket] += 1
+        var offset = 0
+        for bucket in range(RADIX_SIZE):
+            var size = Int(counts[bucket])
+            counts[bucket] = Int64(offset)
+            offset += size
+        for i in range(n):
+            var index = source[i]
+            var bucket = Int((keys[Int(index)] >> shift) & UInt64(255))
+            destination[counts[bucket]] = index
+            counts[bucket] += 1
+        var temporary = source
+        source = destination
+        destination = temporary
 
 
 def merge_f64_range(
@@ -187,6 +285,7 @@ def argsort_f64(
     values: FPtr,
     idx: IPtr,
     work: IPtr,
+    keys: UPtr,
     n: Int,
     ascending: Bool,
     nan_first: Bool,
@@ -199,6 +298,10 @@ def argsort_f64(
     while i < n:
         idx[i] = Int64(i)
         i += 1
+    if n >= SORT_RADIX_THRESHOLD:
+        materialize_f64_sort_keys(values, keys, n, ascending, nan_first)
+        radix_argsort_f64(keys, idx, work, n)
+        return
     var src = idx
     var dst_ptr = work
     var sorted_in_idx = True
@@ -512,9 +615,18 @@ def mp_groupby_var(
 
 @export("mp_argsort_f64")
 def mp_argsort_f64(
-    values: Int, idx: Int, work: Int, n: Int, ascending: Int, nan_first: Int
+    values: Int,
+    idx: Int,
+    work: Int,
+    keys: Int,
+    n: Int,
+    ascending: Int,
+    nan_first: Int,
 ) abi("C"):
-    argsort_f64(fp(values), ip(idx), ip(work), n, ascending != 0, nan_first != 0)
+    argsort_f64(
+        fp(values), ip(idx), ip(work), up(keys), n,
+        ascending != 0, nan_first != 0,
+    )
 
 
 @export("mp_argsort_i64")

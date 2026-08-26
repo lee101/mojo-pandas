@@ -128,6 +128,25 @@ def test_dataframe_groupby_uses_fortran_contiguous_view():
     )
 
 
+@pytest.mark.parametrize("size", [262_143, 262_147])
+def test_groupby_std_parallel_threshold(size):
+    rng = np.random.default_rng(91)
+    frame = pd.DataFrame(
+        {
+            "key": np.arange(size, dtype=np.int64) % 257,
+            "x": rng.normal(size=size),
+            "y": rng.normal(size=size),
+        }
+    )
+    frame.loc[::101, "x"] = np.nan
+    actual = mpd.DataFrame(frame).groupby("key").std()
+    expected = frame.groupby("key").std()
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(actual), expected, check_frame_type=False,
+        rtol=1e-11, atol=1e-11,
+    )
+
+
 def test_groupby_boundary_rejects_mismatched_lengths_and_dtypes():
     with pytest.raises(ValueError, match="same row count"):
         _kernels.groupby_reduce(

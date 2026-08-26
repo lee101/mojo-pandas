@@ -29,8 +29,8 @@ def groupby_reduce(codes, values, ngroups: int, op: str, *, ddof: int = 1, min_c
         values = values[:, None]
     values = np.asfortranarray(values)
     shape = (ngroups, values.shape[1])
-    result = np.full(shape, np.nan, dtype=np.float64)
-    counts = np.zeros(shape, dtype=np.int64)
+    result = np.full(shape, np.nan, dtype=np.float64, order="F")
+    counts = np.zeros(shape, dtype=np.int64, order="F")
     if not result.size or not len(codes):
         if op in {"sum", "count"} and min_count <= 0:
             result.fill(0.0)
@@ -38,7 +38,7 @@ def groupby_reduce(codes, values, ngroups: int, op: str, *, ddof: int = 1, min_c
             result.fill(1.0)
         return result, counts
     if op in {"var", "std"}:
-        means = np.empty(shape, dtype=np.float64)
+        means = np.empty(shape, dtype=np.float64, order="F")
         lib().mp_groupby_var(
             addr(codes), addr(values), addr(result), addr(means), addr(counts),
             len(codes), values.shape[1], ngroups, ddof, op == "std",
@@ -68,8 +68,10 @@ def argsort(values, *, ascending: bool = True, na_position: str = "last"):
         lib().mp_argsort_i64(addr(data), addr(idx), addr(work), len(data), ascending)
     elif array.dtype == np.dtype(np.float64):
         data = np.ascontiguousarray(array)
+        keys = np.empty(len(data), dtype=np.uint64)
         lib().mp_argsort_f64(
-            addr(data), addr(idx), addr(work), len(data), ascending, na_position == "first"
+            addr(data), addr(idx), addr(work), addr(keys), len(data), ascending,
+            na_position == "first",
         )
     else:
         raise TypeError("Mojo sort supports int64 and float64 keys")

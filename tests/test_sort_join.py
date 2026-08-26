@@ -63,6 +63,19 @@ def test_float_sort_simd_tail_special_values(ascending, na_position):
     pd.testing.assert_series_equal(pd.Series(actual), expected)
 
 
+@pytest.mark.parametrize("size", [2_047, 2_053])
+@pytest.mark.parametrize("ascending", [True, False])
+def test_float_sort_radix_threshold_and_simd_tail(size, ascending):
+    values = (np.arange(size, dtype=np.float64)[::-1] % 127) - 63
+    values[::97] = np.nan
+    values[1::211] = -0.0
+    actual = _kernels.argsort(values, ascending=ascending, na_position="last")
+    expected = pd.Series(values).sort_values(
+        ascending=ascending, na_position="last", kind="stable"
+    ).index.to_numpy(dtype=np.int64)
+    np.testing.assert_array_equal(actual, expected)
+
+
 @pytest.mark.parametrize("size", [262_143, 262_147])
 def test_integer_sort_parallel_threshold(size):
     values = (np.arange(size, dtype=np.int64)[::-1] % 8191) - 4096

@@ -14,7 +14,7 @@ I = ctypes.c_int64
 _SIGNATURES = {
     "mp_groupby_reduce": ([I] * 10, None),
     "mp_groupby_var": ([I] * 10, None),
-    "mp_argsort_f64": ([I] * 6, None),
+    "mp_argsort_f64": ([I] * 7, None),
     "mp_argsort_i64": ([I] * 5, None),
     "mp_rolling_reduce": ([I] * 8, None),
     "mp_join_count": ([I] * 11, I),

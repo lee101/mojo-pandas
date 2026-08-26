@@ -88,19 +88,21 @@ and pandas 3.0.3:
 
 | Kernel | Rows | pandas (ms) | Mojo (ms) | Speedup |
 |---|---:|---:|---:|---:|
-| groupby sum (2 cols) | 1,000,000 | 135.872 | 86.433 | 1.57x |
-| groupby std (2 cols) | 1,000,000 | 120.594 | 76.497 | 1.58x |
-| stable sort | 500,000 | 122.814 | 119.972 | 1.02x |
-| left hash join | 500,000 | 236.046 | 76.118 | 3.10x |
-| rolling mean (w=128) | 1,000,000 | 26.722 | 15.427 | 1.73x |
-| rolling min (w=128) | 1,000,000 | 33.127 | 22.146 | 1.50x |
-| resample hourly sum | 500,000 | 8.361 | 7.173 | 1.17x |
+| groupby sum (2 cols) | 1,000,000 | 89.428 | 61.699 | 1.45x |
+| groupby std (2 cols) | 1,000,000 | 71.717 | 68.256 | 1.05x |
+| stable sort | 500,000 | 77.928 | 60.871 | 1.28x |
+| left hash join | 500,000 | 118.391 | 59.540 | 1.99x |
+| rolling mean (w=128) | 1,000,000 | 21.760 | 15.139 | 1.44x |
+| rolling min (w=128) | 1,000,000 | 30.866 | 22.770 | 1.36x |
+| resample hourly sum | 500,000 | 8.280 | 3.684 | 2.25x |
 
 Speedup is `pandas time / mojo-pandas time`; values below 1.00x mean the Mojo
 path is slower. Results are a snapshot of one run, not a general performance
 guarantee.
 
-There is no GPU path.
+There is no GPU path. The covered hot kernels are sorting, hash-table probes,
+scatter reductions, and streaming windows, all with arithmetic intensity well
+below 2 flops per byte. Host/device transfers would dominate these workloads.
 
 ## How it works
 
@@ -112,10 +114,11 @@ so no Python object or allocator crosses the boundary.
 
 Grouped values use pandas' native column-major `float64` block views without a
 layout copy; group codes, sort indices, and join keys are contiguous `int64`.
-Grouped reductions make one column-streaming pass (two for variance), rolling
-sums and moments use constant-time window updates, and rolling min/max uses a
-monotonic deque. Stable float sorting generates normalized IEEE keys with SIMD
-and uses original row positions as tie breakers. Large integer sort passes can
-run in parallel. Joins use an open-addressed integer hash table with linked
+Grouped reductions make one column-streaming pass (two for variance), with
+column-major result scratch and thresholded column parallelism for large
+variance reductions. Rolling sums and moments use constant-time window updates,
+and rolling min/max uses a monotonic deque. Stable float sorting materializes
+normalized IEEE keys with SIMD and uses an eight-pass stable radix sort for
+large inputs. Joins use an open-addressed integer hash table with linked
 duplicate rows. Resampling asks pandas only for its exact datetime bin codes
 and then performs the reductions in the same Mojo groupby kernel.

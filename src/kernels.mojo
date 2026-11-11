@@ -1,6 +1,3 @@
-"""Columnar pandas kernels exposed through a small C ABI."""
-
-from max.algorithm import parallelize
 from std.math import iota, isnan, sqrt
 from std.memory import stack_allocation
 from std.sys.info import simd_width_of
@@ -8,7 +5,6 @@ from std.sys.info import simd_width_of
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime UPtr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
-comptime GROUPBY_PARALLEL_THRESHOLD = 262_144
 comptime SORT_RADIX_THRESHOLD = 2_048
 
 
@@ -142,19 +138,10 @@ def groupby_var(
     for k in range(size):
         counts[k] = 0
 
-    @parameter
-    def process_column(j: Int):
+    for j in range(ncols):
         groupby_var_column(
             codes, values, dst, means, counts, n, ncols, ngroups, j
         )
-
-    if n >= GROUPBY_PARALLEL_THRESHOLD and ncols > 1:
-        parallelize[process_column](ncols, min(ncols, 4))
-    else:
-        for j in range(ncols):
-            groupby_var_column(
-                codes, values, dst, means, counts, n, ncols, ngroups, j
-            )
 
     for k in range(size):
         if Int(counts[k]) > ddof:
@@ -197,7 +184,7 @@ def materialize_f64_sort_keys(
     )
     var i = 0
     while i + W <= n:
-        var bits = words.load[width=W](i)
+        var bits = words.unsafe_load[width=W](i)
         var negative = (bits & sign).ne(0)
         var normalized = negative.select(~bits, bits ^ sign)
         normalized = ((bits & ~sign).eq(0)).select(sign, normalized)
@@ -316,7 +303,7 @@ def argsort_f64(
     if not sorted_in_idx:
         i = 0
         while i + W <= n:
-            idx.store(i, src.load[width=W](i))
+            idx.store(i, src.unsafe_load[width=W](i))
             i += W
         while i < n:
             idx[i] = src[i]
@@ -385,7 +372,7 @@ def argsort_i64(values: IPtr, idx: IPtr, work: IPtr, n: Int, ascending: Bool):
     if not sorted_in_idx:
         i = 0
         while i + W <= n:
-            idx.store(i, src.load[width=W](i))
+            idx.store(i, src.unsafe_load[width=W](i))
             i += W
         while i < n:
             idx[i] = src[i]
